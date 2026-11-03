@@ -1,0 +1,16 @@
+# Secrets and personal state - never commit these
+config.json
+session.json
+turns.jsonl
+ratings.jsonl
+*.log
+.env
+
+# Build output and dependencies
+node_modules/
+bipmax-app/dist/
+stt/.venv/
+__pycache__/
+*.pyc
+*.zab
+*-qr.png

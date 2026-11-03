@@ -1,0 +1,4 @@
+faster-whisper
+av
+numpy
+edge-tts

@@ -1,0 +1,252 @@
+/*
+ * Side Service of the Bip Max app: runs inside the Zepp app on the iPhone and forwards the watch's
+ * requests to the watch relay (relay.js) on the user's own PC or cloud machine over Tailscale. The relay URL and
+ * token come from the phone settings (Hermes > Settings), see shared/connection.js.
+ * - binary envelope (recording) -> POST /watch/ask {audio_b64}; long ones come in pieces (part i
+ *   of n, shared/pieces.js): earlier pieces are kept and answered {ok, got}, the last one sends
+ *   the whole clip
+ * - confirm {id, yes}           -> POST /watch/confirm
+ * - result {job}                -> POST /watch/result {job}
+ * - last                        -> GET /watch/last (reply missed while the watch app was closed)
+ * - typed {text, speak, rid}  -> POST /watch/ask {text} (the on-watch keyboard)
+ * - rate {rate, kind}           -> POST /watch/rate (thumbs up / down under an answer; kind none = undo)
+ * - newChat                     -> POST /watch/ask {text: 'start new session'} (New chat button)
+ * - speech {id, parts}          -> GET /watch/speech?id=&part=N (MP3 per clip), sent on to the watch as files
+ * - diag {events}               -> POST /watch/diag (only when shared/debug.js DIAG is on)
+ * ask/confirm/result carry speak: true while Voice is on, so replies come with a speech id; the
+ * phone starts fetching and sending that audio itself as the reply passes through (saves a
+ * watch->phone round trip), and the watch's own `speech` request just waits for the same job.
+ * Side Service fetch only sends string bodies, so audio goes as base64 in JSON.
+ * Lost replies are retried by the watch only (it owns the rid and resends after 25 s, 70 s for
+ * Yes/No; iOS pauses this service's timers while the phone is locked). Here each request is one
+ * attempt; no reply within its limit comes back as {retry: true}, which the watch resends.
+ */
+import { BaseSideService } from '@zeppos/zml/base-side'
+import { parseEnvelope, base64 } from '../shared/envelope'
+import { readConnection } from '../shared/connection'
+import { newRid, withTimeout } from '../shared/retry'
+import { onceBy } from '../shared/once'
+import { DIAG } from '../shared/debug'
+import { pieceStore } from '../shared/pieces'
+import { DIM_KEY, dimSeconds } from '../shared/dimsetting'
+import { TEXT_SIZE_KEY, textSizePercent } from '../shared/textsize'
+import { AUTO_LISTEN_KEY, autoListenOn } from '../shared/autolisten'
+
+// Names this watch to the relay in a header (the relay serves one watch and does not need it).
+const WATCH_ID = 'bipmax'
+const pieces = pieceStore()
+const speechJobs = new Map() // speech id -> promise of {ok, error?}: each answer is fetched and sent once
+
+// The relay URL and token the user typed into Hermes > Settings in the Zepp app (read on every call, so a change applies at once).
+const conn = () => readConnection(settings.settingsStorage)
+const authHeaders = (c) => ({ Authorization: `Bearer ${c.token}`, 'x-watch-id': WATCH_ID })
+
+const UNREACHABLE = "Can't reach the PC (is Tailscale on?)"
+
+// Just under the watch's own resend times (25 s / 70 s), so when this service's timer does run,
+// the watch hears {retry: true} and resends at once instead of waiting out its own timer.
+const ASK_MS = 20000
+const CONFIRM_MS = 65000 // Yes/No can legitimately take up to a minute (sending a text, waking the car)
+const POLL_MS = 15000
+
+const errText = (e) => String(e && e.message ? e.message : e)
+
+function parse(res) {
+  try {
+    return typeof res.body === 'string' ? JSON.parse(res.body) : res.body
+  } catch (e) {
+    return null
+  }
+}
+
+async function call(method, path, payload, limitMs = ASK_MS) {
+  const c = conn()
+  if (c.error) return { ok: false, error: c.error }
+  const t0 = Date.now()
+  try {
+    const res = await withTimeout(fetch({
+      url: `${c.relay}${path}`,
+      method,
+      headers: { 'Content-Type': 'application/json', ...authHeaders(c) },
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
+    }), limitMs, () => null)
+    if (!res) {
+      const why = `${path.split('?')[0]}: no reply after ${Date.now() - t0} ms`
+      console.log('fetch lost', why)
+      return { ok: false, error: `${UNREACHABLE}\n[${why}]`, retry: true }
+    }
+    const data = parse(res)
+    if (res.status === 401) return { ok: false, error: 'The watch token was rejected by the PC.' }
+    if (res.status !== 200 || !data) return { ok: false, error: `PC error ${res.status} (${path.split('?')[0]})` }
+    return data
+  } catch (e) {
+    // The reason stays on screen so a failure can be traced from a photo of the watch.
+    const why = `${path.split('?')[0]}: ${errText(e)} after ${Date.now() - t0} ms`
+    console.log('fetch failed', why)
+    return { ok: false, error: `${UNREACHABLE}\n[${why}]`, retry: true } // the watch resends on this
+  }
+}
+
+function ask(buf) {
+  let env
+  try {
+    env = parseEnvelope(buf)
+  } catch (e) {
+    return Promise.resolve({ ok: false, error: 'The recording got garbled on the way. Try again.' })
+  }
+  const h = env.header
+  let audio = env.audio
+  if (h.parts > 1) {
+    audio = pieces.put(String(h.rid), h.part, h.parts, env.audio.slice()) // slice: keep a copy, not a view
+    if (h.part < h.parts) return Promise.resolve({ ok: true, got: h.part })
+    if (!audio) return Promise.resolve({ ok: false, error: `Part of the recording got lost (piece ${pieces.missing(String(h.rid)).join(', ')}). Try again.` })
+  }
+  // The watch's GPS fix (loc), or why there is none (gps), rides along on the question.
+  const t0 = Date.now()
+  return call('POST', '/watch/ask', { audio_b64: base64(audio), rid: h.rid || newRid(), speak: !!h.speak, loc: h.loc, gps: h.gps, ...(h.preview ? { preview: true } : {}) })
+    .then((r) => (r && r.kind === 'transcript' ? { ...r, phone_ms: Date.now() - t0 } : r)) // phone -> PC -> phone, for the timing line
+}
+
+// Short status lines into the relay log (POST /watch/diag), because this side service's own
+// console can't be read from the PC. Only with DIAG on; fire and forget.
+function diag(from, ...events) {
+  if (!DIAG) return
+  const c = conn()
+  if (c.error) return
+  try {
+    fetch({ url: `${c.relay}/watch/diag`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(c) },
+      body: JSON.stringify({ from, events }) }).catch(() => {})
+  } catch (e) {}
+}
+
+// The watch's link black box (shared/linklog.js): always sent, whatever DIAG says - a few lines per
+// request that got through, and only when something went wrong.
+function diagLink(events) {
+  // Resolves {ok: true} only when the relay answered, so the watch keeps its lines until they really arrived.
+  const c = conn()
+  if (c.error) return Promise.resolve({ ok: false, error: c.error })
+  try {
+    return fetch({ url: `${c.relay}/watch/diag`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(c) },
+      body: JSON.stringify({ from: 'watch', events }) }).then(() => ({ ok: true }), (e) => ({ ok: false, error: errText(e) }))
+  } catch (e) {
+    return Promise.resolve({ ok: false, error: errText(e) })
+  }
+}
+
+// Downloaded MP3s are kept under a few rotating names, so they don't pile up in the Zepp app
+// (the side service can't delete files). If overwriting one ever fails, a one-off name is used.
+const SPEECH_SLOTS = 4 // an answer can use two (first sentence + the rest)
+let speechSlot = 0
+
+// Spoken answer: download the MP3 from the relay, then send it to the watch (zml file transfer).
+// Resolves when the watch has it, so a failure can be shown on the watch.
+function sendSpeech(svc, id, trigger, part = 1, parts = 1) {
+  const c = conn()
+  if (c.error) return Promise.resolve({ ok: false, error: c.error })
+  const t0 = Date.now()
+  const step = (what) => diag('phone', `speech ${id}.${part}: ${what} (+${Date.now() - t0} ms)`)
+  step(`start (${trigger})`)
+  return new Promise((resolve) => {
+    let settled = false
+    let task = null
+    const done = (r) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      step(r.ok ? 'done' : `failed: ${r.error}`)
+      resolve(r)
+    }
+    const timer = setTimeout(() => {
+      try {
+        if (task && task.cancel) task.cancel() // don't send a file the watch has given up on
+      } catch (e) {}
+      done({ ok: false, error: 'Voice: timed out sending the audio to the watch.' })
+    }, 90000)
+    const start = (file, fallback) => {
+      try {
+        task = svc.download(`${c.relay}/watch/speech?id=${encodeURIComponent(id)}&part=${part}`,
+          { timeout: 40000, headers: authHeaders(c), filePath: file })
+      } catch (e) {
+        return fallback ? start(fallback) : done({ ok: false, error: `Voice download didn't start: ${errText(e)}` })
+      }
+      task.onFail = (ev) => {
+        if (settled) return
+        if (fallback) {
+          step(`download to ${file} failed (${ev && ev.code}), trying a one-off name`)
+          return start(fallback)
+        }
+        done({ ok: false, error: `Voice download failed: ${ev && ev.code} ${ev && ev.message}` })
+      }
+      task.onSuccess = (ev) => {
+        if (settled) return
+        step(`downloaded, HTTP ${ev.statusCode}`)
+        if (ev.statusCode !== 200) return done({ ok: false, error: `Voice: the PC answered ${ev.statusCode}.` })
+        try {
+          const sent = svc.sendFile(ev.filePath || ev.tempFilePath || file, { type: 'speech', id, part, parts })
+          step('handed to Bluetooth')
+          sent.on('change', (e) => {
+            const state = e && e.data && e.data.readyState
+            step(`transfer ${state}`)
+            if (state === 'transferred') done({ ok: true, sent: true })
+            else if (state === 'error' || state === 'canceled') done({ ok: false, error: `Voice: sending to the watch ${state}.` })
+          })
+        } catch (e) {
+          done({ ok: false, error: `Voice: ${errText(e)}` })
+        }
+      }
+    }
+    speechSlot = (speechSlot + 1) % SPEECH_SLOTS
+    start(`data://download/hermes-speech-${speechSlot}.mp3`, `data://download/hermes-${id}-${part}.mp3`)
+  })
+}
+
+// All of an answer's clips, in order: clip 1 (the first sentence) goes first so it isn't stuck
+// behind the bigger clip 2 on Bluetooth. Reports the first failure, if any.
+async function sendSpeechClips(svc, id, parts, trigger) {
+  let first = null
+  for (let part = 1; part <= parts; part++) {
+    const r = await sendSpeech(svc, id, trigger, part, parts)
+    if (!r.ok && !first) first = r
+  }
+  return first || { ok: true, sent: true }
+}
+
+AppSideService(
+  BaseSideService({
+    onInit() {},
+    onRun() {},
+    onDestroy() {},
+    onRequest(req, res) {
+      const isBinary = req instanceof ArrayBuffer || (req && req.byteLength !== undefined && !req.method)
+      const p = req && req.params ? req.params : {}
+      let work
+      if (isBinary) work = ask(req)
+      else if (req.method === 'confirm') {
+        work = call('POST', '/watch/confirm', { id: p.id, yes: !!p.yes, rid: p.rid || newRid(), speak: !!p.speak }, CONFIRM_MS)
+      }
+      else if (req.method === 'result') work = call('POST', '/watch/result', { job: p.job || '', speak: !!p.speak }, POLL_MS)
+      else if (req.method === 'speech') work = onceBy(speechJobs, String(p.id || ''), () => sendSpeechClips(this, String(p.id || ''), Number(p.parts) || 1, 'watch asked'))
+      else if (req.method === 'linklog') {
+        work = diagLink(Array.isArray(p.events) ? p.events.slice(0, 20) : [])
+      }
+      else if (req.method === 'diag') {
+        diag('watch', ...(Array.isArray(p.events) ? p.events : []))
+        work = Promise.resolve({ ok: true })
+      }
+      else if (req.method === 'settings') work = Promise.resolve({ ok: true, dim_s: dimSeconds(settings.settingsStorage.getItem(DIM_KEY)), text_pct: textSizePercent(settings.settingsStorage.getItem(TEXT_SIZE_KEY)), auto_listen: autoListenOn(settings.settingsStorage.getItem(AUTO_LISTEN_KEY)) }) // phone sliders: when the screen goes black, answer text size
+      else if (req.method === 'typed') work = call('POST', '/watch/ask', { text: String(p.text || ''), speak: !!p.speak, rid: p.rid || newRid(), loc: p.loc, gps: p.gps })
+      else if (req.method === 'rate') work = call('POST', '/watch/rate', { rate: p.rate || '', kind: p.kind || '' }, POLL_MS)
+      else if (req.method === 'sessions') work = call('GET', '/watch/sessions', null, POLL_MS)
+      else if (req.method === 'pickSession') work = call('POST', '/watch/session', { id: p.id || '', rid: p.rid || newRid() }, POLL_MS)
+      else if (req.method === 'last') work = call('GET', '/watch/last', null, POLL_MS)
+      else if (req.method === 'newChat') work = call('POST', '/watch/ask', { text: 'start new session', rid: p.rid || newRid() })
+      else work = Promise.resolve({ ok: false, error: `unknown request ${req.method}` })
+      work.then((r) => {
+        res(null, r) // the text goes to the watch first...
+        if (r && r.speech) onceBy(speechJobs, r.speech, () => sendSpeechClips(this, r.speech, r.speechParts || 1, `reply to ${req.method || 'ask'}`)) // ...then its audio follows
+      }).catch((e) => res(null, { ok: false, error: errText(e) }))
+    },
+  }),
+)
