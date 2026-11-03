@@ -9,6 +9,9 @@ import { AUTO_LISTEN_KEY, autoListenOn } from '../shared/autolisten.js'
 import { RELAY_URL_KEY, TOKEN_KEY, normalizeRelayUrl, cleanToken } from '../shared/connection.js'
 import { DIM_KEY, DIM_MIN, DIM_MAX, DIM_STEP, dimSeconds, dimLabel } from '../shared/dimsetting.js'
 
+// A white box with a border, so the field reads as something to tap and type in.
+const FIELD_STYLE = { background: '#ffffff', backgroundColor: '#ffffff', border: '1px solid #c8c8c8', borderRadius: '10px', padding: '12px 14px', fontSize: '16px', color: '#222222', minHeight: '24px' }
+
 AppSettingsPage({
   build(props) {
     const store = props.settingsStorage
@@ -24,17 +27,19 @@ AppSettingsPage({
       Text({ paragraph: true, style: { color: '#666', marginBottom: '12px' } },
         'The watch talks to the relay (relay.js) running next to your Hermes Agent on your PC or cloud machine, over Tailscale. Your phone needs Tailscale on. Paste the https address that `tailscale serve` gives you, and the token from your relay config.json.'),
       TextInput({
-        label: 'Relay URL (Tailscale)',
+        label: 'Relay URL',
+        settingsKey: RELAY_URL_KEY,
         placeholder: 'https://my-pc.tail1234.ts.net:8453',
-        value: relayRaw,
-        onChange: (v) => store.setItem(RELAY_URL_KEY, String(v || '').trim()),
+        labelStyle: { fontSize: '14px', color: '#333', marginBottom: '4px' },
+        subStyle: FIELD_STYLE,
       }),
       Text({ paragraph: true, style: { color: relay || !relayRaw ? '#666' : '#c0392b', marginTop: '4px', marginBottom: '12px' } }, status),
       TextInput({
         label: 'Token',
+        settingsKey: TOKEN_KEY,
         placeholder: 'the token from your relay config.json',
-        value: store.getItem(TOKEN_KEY) || '',
-        onChange: (v) => store.setItem(TOKEN_KEY, cleanToken(v)),
+        labelStyle: { fontSize: '14px', color: '#333', marginBottom: '4px' },
+        subStyle: FIELD_STYLE,
       }),
       Text({ paragraph: true, style: { color: '#666', marginTop: '4px', marginBottom: '16px' } },
         hasToken ? 'A token is saved. It stays on your phone and goes only to your relay.' : 'No token yet. It stays on your phone and goes only to your relay.'),
